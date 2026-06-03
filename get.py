@@ -19,7 +19,10 @@ CLI** to be installed and authenticated against
 already has ``gh auth login`` set up; the script fails fast with a
 clear message if not. ``gh`` handles all asset fetching + auth +
 retries; this script orchestrates the picker UI, selective download,
-extract, and ``validate.py --quick`` self-check.
+extract, post-extract SHA verify, and a FULL ``validate.py`` self-check
+whose reader-contract gates open every downloaded trace with the
+bundle's shipped ``debug_trace_io`` reader (the consumer-side test of
+that reader against what was downloaded).
 
 Source of truth: ``scripts/model_traces/get.py`` in
 ``tenstorrent/bit_sculpt``. The sister script
@@ -36,7 +39,6 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 _RELEASE_REPO = "tenstorrent/bit_sculpt"
@@ -173,12 +175,17 @@ def gh_release_view(tag: str) -> dict:
 def gh_release_download(
     tag: str, dest: Path, patterns: list[str] | None = None
 ) -> None:
-    """Fetch release assets via gh (auth + retries handled by gh)."""
+    """Fetch release assets via gh (auth + retries handled by gh).
+
+    `--skip-existing` is deliberately NOT used: it was added in a recent gh
+    and is absent on older clients (e.g. gh 2.4.0), so it breaks consumers.
+    Every caller downloads into a freshly-created empty dir, so gh never hits
+    an existing file (the condition --skip-existing / --clobber would guard).
+    """
     cmd = [
         "gh", "release", "download", tag,
         "--repo", _RELEASE_REPO,
         "--dir", str(dest),
-        "--skip-existing",
     ]
     if patterns:
         for p in patterns:
@@ -186,12 +193,23 @@ def gh_release_download(
     subprocess.run(cmd, check=True)
 
 
-def fetch_manifest(tag: str) -> dict:
-    """gh-download manifest.json into a temp dir and parse it."""
-    with tempfile.TemporaryDirectory(prefix="get-manifest-") as td:
-        td_path = Path(td)
-        gh_release_download(tag, td_path, patterns=["manifest.json"])
-        return json.loads((td_path / "manifest.json").read_text())
+def fetch_manifest(tag: str, dest: Path) -> dict:
+    """gh-download manifest.json into a probe dir under `dest` and parse it.
+
+    Contract: get.py must confine all filesystem activity to `dest` (no /tmp
+    side effects), so the manifest probe lives in a hidden subdir of dest that
+    is created fresh and removed once parsed.
+    """
+    dest.mkdir(parents=True, exist_ok=True)
+    probe = dest / ".get_manifest_probe"
+    if probe.exists():
+        shutil.rmtree(probe)
+    probe.mkdir()
+    try:
+        gh_release_download(tag, probe, patterns=["manifest.json"])
+        return json.loads((probe / "manifest.json").read_text())
+    finally:
+        shutil.rmtree(probe, ignore_errors=True)
 
 
 # ---------- Download + extract ----------
@@ -278,7 +296,13 @@ def download_bundle(
     tag: str, trace_tags: list[str] | None, dest: Path
 ) -> None:
     dest.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=f"get-{tag.replace('/', '_')}-"))
+    # Contract: confine ALL activity to dest — stage inside it, never /tmp.
+    # A hidden subdir keeps the staged tarballs/flat files out of the way of
+    # the extracted bundle, and is removed before verify/validate run.
+    staging = dest / ".get_staging"
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
     print(f"[get] staging: {staging}")
 
     # Always fetch release-level + manifest + SHA256SUMS. Trace-specific
@@ -287,8 +311,21 @@ def download_bundle(
     if trace_tags is None:
         patterns = None  # all
     else:
-        patterns = ["manifest.json", "SHA256SUMS", "REPORT.md",
-                    "debug_trace_io.py", "validate.py"]
+        # Selective download: fetch ALL release-level assets (not just the
+        # well-known flat files) so validate.py's complete-coverage of
+        # release-level assets still holds — e.g. diversity_plots.tar.zst is
+        # a release-level tarball that a hardcoded list would silently drop.
+        # manifest.json + SHA256SUMS are sibling integrity files (not asset
+        # entries), so list them explicitly; everything else comes from the
+        # manifest's release-level assets (trace_tag is None).
+        release_level = [
+            a["name"] for a in fetch_manifest(tag, dest).get("assets", [])
+            if a.get("trace_tag") is None
+        ]
+        patterns = list(dict.fromkeys(
+            ["manifest.json", "SHA256SUMS", "REPORT.md",
+             "debug_trace_io.py", "validate.py", *release_level]
+        ))
         for tt in trace_tags:
             patterns.append(f"{tt}--*")
 
@@ -318,6 +355,11 @@ def download_bundle(
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(src), str(target))
 
+    # Staging is fully consumed (tarballs extracted, flat files moved). Remove
+    # it now so the post-extract verify + validate.py see a clean dest and
+    # nothing extra lingers inside it.
+    shutil.rmtree(staging, ignore_errors=True)
+
     # Post-extract: verify the extracted .safetensors against the
     # extracted-namespace lines in SHA256SUMS (manifest v3 extracted_files).
     # SHA256SUMS was moved into dest by the flat-file loop above. This
@@ -328,17 +370,27 @@ def download_bundle(
     if sums_in_dest.is_file():
         _verify_sha256sums(dest, sums_in_dest, label="post-extract .safetensors")
 
+    # Full validate.py (NOT --quick): the reader-contract gates (8-14) open
+    # each downloaded trace with the bundle's shipped debug_trace_io
+    # ChunkedTraceReader and check per-layer shapes / dtypes / KV layout /
+    # alias rule / routing / top-K. This is the consumer-side test of the
+    # SHIPPED reader against what was actually downloaded — the whole point
+    # of bundling debug_trace_io.py. (--quick would skip exactly these gates,
+    # leaving the reader shipped-but-never-exercised.) validate.py skips the
+    # reader gates for any trace dir absent from a selective download.
     validate = dest / "validate.py"
     if validate.is_file():
-        print(f"[get] running validate.py --quick ...")
-        subprocess.run(
-            [sys.executable, str(validate), str(dest), "--quick"],
-            check=True,
-        )
+        print(f"[get] running validate.py (full: reader-contract gates exercise debug_trace_io) ...")
+        cmd = [sys.executable, str(validate), str(dest)]
+        if trace_tags is not None:
+            # Selective download: tell validate.py which traces are actually
+            # present so per-trace gates (asset presence, schema, reader
+            # contract) scope to them instead of failing on the absent ones.
+            cmd += ["--downloaded-traces", ",".join(trace_tags)]
+        subprocess.run(cmd, check=True)
     else:
         print(f"[get] (validate.py absent — skipping self-check)")
 
-    shutil.rmtree(staging, ignore_errors=True)
     print(f"[get] bundle ready at: {dest}")
 
 
@@ -374,8 +426,12 @@ def _trace_summary(t: dict) -> str:
 
 
 def _interactive_trace_picker(tag: str) -> int:
+    # Ask for the destination first: the manifest probe (and all later
+    # activity) must live inside dest per the release contract — no /tmp.
+    default = f"~/{tag.replace('/', '_')}"
+    dest = Path(prompt_dest(default))  # prompt_dest already expands ~
     print(f"[get] fetching manifest for {tag} ...")
-    manifest = fetch_manifest(tag)
+    manifest = fetch_manifest(tag, dest)
     traces = manifest.get("traces", [])
     if not traces:
         print("(no traces in this release)")
@@ -388,9 +444,7 @@ def _interactive_trace_picker(tag: str) -> int:
     else:
         chosen_indices = pick_many("Select traces:", options)
     chosen = [trace_tags[i] for i in chosen_indices]
-    default = f"~/{tag.replace('/', '_')}"
-    dest = prompt_dest(default)
-    download_bundle(tag, trace_tags=chosen, dest=Path(dest))
+    download_bundle(tag, trace_tags=chosen, dest=dest)
     return 0
 
 
