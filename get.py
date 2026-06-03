@@ -214,6 +214,21 @@ def fetch_manifest(tag: str, dest: Path) -> dict:
 
 # ---------- Download + extract ----------
 
+def _python_has_torch() -> bool:
+    """Whether the interpreter that runs validate.py can import torch.
+
+    validate.py's reader-contract gates open traces via debug_trace_io, which
+    imports torch. get.py and validate.py run under the same interpreter
+    (sys.executable), so checking here is accurate. find_spec only checks
+    installability — it does not pay the (slow) cost of importing torch.
+    """
+    try:
+        import importlib.util
+        return importlib.util.find_spec("torch") is not None
+    except Exception:
+        return False
+
+
 def _have_tar_zstd() -> bool:
     try:
         r = subprocess.run(
@@ -379,8 +394,22 @@ def download_bundle(
     # leaving the reader shipped-but-never-exercised.) validate.py skips the
     # reader gates for any trace dir absent from a selective download.
     validate = dest / "validate.py"
-    if validate.is_file():
-        print(f"[get] running validate.py (full: reader-contract gates exercise debug_trace_io) ...")
+    if not validate.is_file():
+        print("[get] (validate.py absent — skipping self-check)")
+    elif not _python_has_torch():
+        # validate.py's reader-contract gates open traces with debug_trace_io,
+        # which imports torch. A consumer who only wants the trace files need
+        # not have torch installed — and the download is already integrity-
+        # verified above via SHA256SUMS (the release contract's core
+        # guarantee). So skip the reader self-check rather than hard-fail.
+        print(
+            "[get] torch not installed — skipping the validate.py reader "
+            "self-check (download integrity already verified via SHA256SUMS). "
+            f"Install torch and run `python3 {validate} {dest}` to exercise "
+            "the bundled debug_trace_io reader."
+        )
+    else:
+        print("[get] running validate.py (full: reader-contract gates exercise debug_trace_io) ...")
         cmd = [sys.executable, str(validate), str(dest)]
         if trace_tags is not None:
             # Selective download: tell validate.py which traces are actually
@@ -388,8 +417,6 @@ def download_bundle(
             # contract) scope to them instead of failing on the absent ones.
             cmd += ["--downloaded-traces", ",".join(trace_tags)]
         subprocess.run(cmd, check=True)
-    else:
-        print(f"[get] (validate.py absent — skipping self-check)")
 
     print(f"[get] bundle ready at: {dest}")
 
