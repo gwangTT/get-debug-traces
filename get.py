@@ -225,34 +225,53 @@ def _extract_tarball(tarball: Path, dest: Path, use_native_zstd: bool) -> None:
             raise RuntimeError(f"zstd -dc failed on {tarball}")
 
 
-def _verify_sha256sums(staging: Path) -> None:
-    """Verify every file in `staging` matches its line in SHA256SUMS."""
-    sums_file = staging / "SHA256SUMS"
-    if not sums_file.is_file():
-        print("[get] WARN: SHA256SUMS not present in download — skipping verify")
-        return
+def _verify_sha256sums(root: Path, sums_path: Path | None = None, *, label: str = "") -> int:
+    """Verify files under `root` against their SHA256SUMS lines.
+
+    Lines whose file is absent under `root` are skipped (the
+    `sha256sum -c --ignore-missing` equivalent), so this works in BOTH
+    contexts against the single dual-namespace SHA256SUMS:
+      - pre-extract over the staging dir: the asset-namespace lines
+        (`<tag>--*.tar.zst`, flat files) resolve; the extracted-namespace
+        lines (`<tag>/...`) are absent → skipped.
+      - post-extract over the dest bundle: the extracted-namespace lines
+        (`<tag>/ffn_context/...`, `<tag>/kv_cache_layer_*.safetensors`, …)
+        resolve; the tarball-namespace lines are gone → skipped.
+
+    `sums_path` defaults to `root/SHA256SUMS`. Returns the number of files
+    actually verified (non-skipped). Raises on any content mismatch.
+    """
     import hashlib
+    sums_file = sums_path if sums_path is not None else (root / "SHA256SUMS")
+    if not sums_file.is_file():
+        print("[get] WARN: SHA256SUMS not present — skipping verify")
+        return 0
     failed = []
+    checked = 0
     for line in sums_file.read_text().splitlines():
         line = line.strip()
         if not line:
             continue
         sha, name = line.split(maxsplit=1)
-        target = staging / name
+        target = root / name
         if not target.is_file():
-            continue  # selectively downloaded; ok
+            continue  # absent in this context (selective download / namespace) — ok
         h = hashlib.sha256()
         with open(target, "rb") as f:
             for chunk in iter(lambda: f.read(1 << 20), b""):
                 h.update(chunk)
         if h.hexdigest() != sha:
             failed.append(name)
+        else:
+            checked += 1
     if failed:
         raise RuntimeError(
             f"sha256 mismatch on {len(failed)} files: "
             f"{failed[:3]}{' ...' if len(failed) > 3 else ''}"
         )
-    print(f"[get] SHA256SUMS verified")
+    tag = f" ({label})" if label else ""
+    print(f"[get] SHA256SUMS verified{tag}: {checked} file(s)")
+    return checked
 
 
 def download_bundle(
@@ -276,7 +295,8 @@ def download_bundle(
     print(f"[get] gh release download {tag} (patterns: {patterns or 'all'}) ...")
     gh_release_download(tag, staging, patterns=patterns)
 
-    _verify_sha256sums(staging)
+    # Pre-extract: verify the downloaded assets (tarball + flat namespace).
+    _verify_sha256sums(staging, label="pre-extract assets")
 
     use_native = _have_tar_zstd()
     print(f"[get] extracting tarballs (tar --zstd: {use_native}) ...")
@@ -297,6 +317,16 @@ def download_bundle(
             target = dest / name
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(src), str(target))
+
+    # Post-extract: verify the extracted .safetensors against the
+    # extracted-namespace lines in SHA256SUMS (manifest v3 extracted_files).
+    # SHA256SUMS was moved into dest by the flat-file loop above. This
+    # realizes the per-extracted-file integrity guarantee in the default
+    # consumer flow (not just a manual `sha256sum -c`). On a v2 bundle
+    # (no extracted-namespace lines) this verifies 0 extra files — harmless.
+    sums_in_dest = dest / "SHA256SUMS"
+    if sums_in_dest.is_file():
+        _verify_sha256sums(dest, sums_in_dest, label="post-extract .safetensors")
 
     validate = dest / "validate.py"
     if validate.is_file():
