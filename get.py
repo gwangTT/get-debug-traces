@@ -34,6 +34,7 @@ above always serves the bit_sculpt canonical version.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -42,6 +43,8 @@ import sys
 from pathlib import Path
 
 _RELEASE_REPO = "tenstorrent/bit_sculpt"
+_MANIFEST_NAME = "manifest.json"
+_SHA256SUMS_NAME = "SHA256SUMS"
 
 # Set from --verbose in main(); gates the extra per-file/per-component logging.
 _VERBOSE = False
@@ -212,14 +215,16 @@ def gh_release_download(tag: str, dest: Path, patterns: list[str] | None = None)
     subprocess.run(cmd, check=True)
 
 
-def _fetch_release_metadata(tag: str, dest: Path) -> tuple[dict, str]:
+def _fetch_release_metadata(tag: str, dest: Path) -> tuple[dict, bytes, bytes]:
     """gh-download manifest.json + SHA256SUMS into a probe dir under `dest`,
-    returning (manifest dict, SHA256SUMS text).
+    returning (manifest dict, manifest.json bytes, SHA256SUMS bytes).
 
     These two tiny files describe the whole release, so we fetch them first —
-    cheaply — to (a) enumerate release-level assets for a selective download and
-    (b) detect whether `dest` already holds this release so the heavy asset
-    download can be skipped.
+    cheaply — to (a) enumerate every asset + its sha for a selective per-asset
+    download and (b) detect which files `dest` already holds so the heavy asset
+    download can be skipped. The raw bytes are returned so the caller can persist
+    a BYTE-IDENTICAL index to `dest` (the released SHA256SUMS has a line covering
+    manifest.json, so a re-serialized copy would fail the post-extract verify).
 
     Contract: get.py must confine all filesystem activity to `dest` (no /tmp
     side effects), so the probe lives in a hidden subdir of dest that is
@@ -231,10 +236,11 @@ def _fetch_release_metadata(tag: str, dest: Path) -> tuple[dict, str]:
         shutil.rmtree(probe)
     probe.mkdir()
     try:
-        gh_release_download(tag, probe, patterns=["manifest.json", "SHA256SUMS"])
-        manifest = json.loads((probe / "manifest.json").read_text())
-        sums_text = (probe / "SHA256SUMS").read_text()
-        return manifest, sums_text
+        gh_release_download(tag, probe, patterns=[_MANIFEST_NAME, _SHA256SUMS_NAME])
+        manifest_bytes = (probe / _MANIFEST_NAME).read_bytes()
+        sums_bytes = (probe / _SHA256SUMS_NAME).read_bytes()
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+        return manifest, manifest_bytes, sums_bytes
     finally:
         shutil.rmtree(probe, ignore_errors=True)
 
@@ -289,104 +295,327 @@ def _extract_tarball(tarball: Path, dest: Path, use_native_zstd: bool) -> None:
             raise RuntimeError(f"zstd -dc failed on {tarball}")
 
 
-def _expected_files_by_component(manifest: dict) -> tuple[dict[str, set[str]], list[str]]:
-    """Map each release COMPONENT to the post-extract files it should produce.
+# ---------- Per-asset reuse: hashing, path resolution, fetch planning ----------
+#
+# A release bundle carries TWO on-disk namespaces (see write_release_manifest.py):
+#   - assets        : the downloadable files (tarballs + flat files), keyed by
+#                     asset name, each with its own sha256 (manifest["assets"]).
+#   - extracted_files: every .safetensors AS IT LANDS post-extract, keyed by its
+#                     dest-relative path "<tag>/<rel>" with sha256 (v3 only).
+# Per-asset reuse hashes what's already in `dest` against these structured hashes
+# and downloads only the assets whose post-conditions aren't already satisfied.
+# SHA256SUMS stays the flat-text mirror used by the final _verify_sha256sums gate.
 
-    A component is a trace tag (e.g. ``vllm-ef537f25-8193tok``) or the special
-    ``"__release__"`` group (top-level files: REPORT.md, debug_trace_io.py,
-    validate.py). Returns ``(expected, release_tar_dirs)`` where:
-      - ``expected[component]`` is the set of dest-relative paths that must
-        exist for that component to be considered fully present;
-      - ``release_tar_dirs`` are extracted-dir names for release-level tarballs
-        (e.g. ``diversity_plots``) whose individual files aren't in the
-        ``extracted_files`` registry — checked as a non-empty dir instead.
 
-    Built from ``assets`` (flat files map by stripping the ``<tag>--`` prefix)
-    + the v3 ``extracted_files`` registry (every per-trace ``.safetensors``,
-    incl. tarball-extracted rows). Empty if the manifest isn't v3 (no registry
-    to confirm completeness → caller must download).
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _flat_asset_relpath(name: str, trace_tag: str | None) -> str:
+    """Dest-relative path a FLAT (non-tarball) asset lands at after placement.
+
+    Release-level flat files (REPORT.md, debug_trace_io.py, validate.py) move
+    verbatim to ``<name>``; per-trace flat files (``<tag>--<rest>``, e.g.
+    ``<tag>--kv_cache_layer_0.safetensors``, index.json, metadata.json) move to
+    ``<tag>/<rest>``.
     """
-    expected: dict[str, set[str]] = {}
-    release_tar_dirs: list[str] = []
-    if manifest.get("format_version") != 3:
-        return expected, release_tar_dirs
-    for a in manifest.get("assets", []):
-        name = a["name"]
-        tag = a.get("trace_tag")
-        if tag is None:
-            if name.endswith(".tar.zst"):
-                release_tar_dirs.append(name[: -len(".tar.zst")])
-            else:
-                expected.setdefault("__release__", set()).add(name)
-        elif not name.endswith(".tar.zst"):
-            # Per-trace flat file (kv_cache_*.safetensors, index.json, metadata.json)
-            # extracts to <tag>/<stripped>.
-            expected.setdefault(tag, set()).add(f"{tag}/{name.split('--', 1)[1]}")
-    for e in manifest.get("extracted_files", []):
-        path = e["path"]
-        expected.setdefault(path.split("/", 1)[0], set()).add(path)
-    return expected, release_tar_dirs
+    if trace_tag is None:
+        return name
+    return f"{trace_tag}/{name[len(trace_tag) + 2 :]}"  # strip "<tag>--"
 
 
-def _components_present(dest: Path, manifest: dict, sums_text: str) -> set[str]:
-    """Components ('__release__' / trace tags) already fully present in `dest`.
+# Per-(stream, layer) tarballs extract into a NESTED family subdir the tarball
+# stem alone doesn't encode. This MIRRORS validate.py's resolver (_NESTED_FAMILY
+# / _NESTED_PREFIX) and the release skill's tar layout — keep the three in sync
+# when a model adds a new nested stream. Whole-family tarballs (topk, routing,
+# dsa, …) fall through to the generic ``<tag>/<stem>`` form, so a new flat family
+# needs no edit here. Mis-resolution only ever costs a redundant re-fetch (the
+# attribution check in _plan_fetch falls back to per-tag), never a wrong skip.
+_NESTED_FAMILY = {"decoder_input_layer_0": "decoder_io"}
+_NESTED_PREFIX = (
+    ("decoder_output_layer_", "decoder_io"),
+    ("post_attn_residual_layer_", "ffn_context"),
+    ("gate_logits_layer_", "ffn_context"),
+    ("gate_scores_layer_", "ffn_context"),
+)
 
-    Existence-only (the post-extract SHA verify is authoritative afterward).
-    Gated on a same-release check: dest must hold this exact release's
-    manifest.json (matching release_commit) + SHA256SUMS, else nothing is
-    trusted (a stale/different release in dest → re-download everything).
+
+def _tarball_extract_prefix(name: str, trace_tag: str | None) -> str:
+    """Dest-relative DIR a tarball asset extracts into (no trailing slash).
+
+    release-level ``<stem>.tar.zst``    -> ``<stem>``
+    per-trace ``<tag>--<stem>.tar.zst`` -> ``<tag>/<family>/<stem>`` (nested
+                                           streams) or ``<tag>/<stem>``.
     """
-    expected, release_tar_dirs = _expected_files_by_component(manifest)
-    if not expected:
-        _vprint(
-            "[get] manifest has no extracted_files registry (pre-v3) — "
-            "can't confirm existing files; will download everything"
-        )
-        return set()  # not v3 / no registry — can't confirm anything
-    dm = dest / "manifest.json"
-    ds = dest / "SHA256SUMS"
-    if not dm.is_file() or not ds.is_file():
-        _vprint(f"[get] no prior manifest.json/SHA256SUMS in {dest} — fresh download")
-        return set()
-    try:
-        if json.loads(dm.read_text()).get("release_commit") != manifest.get("release_commit"):
-            _vprint("[get] dest manifest.json is for a different release_commit — nothing reused")
-            return set()  # different release cached in dest
-        if ds.read_text() != sums_text:
-            _vprint("[get] dest SHA256SUMS differs from this release — nothing reused")
-            return set()  # integrity manifest changed
-    except (json.JSONDecodeError, OSError):
-        return set()
-    _vprint(f"[get] scanning {dest} for existing components ...")
-    present: set[str] = set()
-    for comp, files in expected.items():
-        missing = sorted(p for p in files if not (dest / p).is_file())
-        if not missing:
-            present.add(comp)
-            _vprint(
-                f"[get]   ✓ {comp}: all {len(files)} file(s) present (will be checksum-validated)"
-            )
-        else:
-            _vprint(
-                f"[get]   ✗ {comp}: {len(files) - len(missing)}/{len(files)} "
-                f"present, {len(missing)} missing → will download:"
-            )
-            for p in missing[:12]:
-                _vprint(f"[get]        - {p}")
-            if len(missing) > 12:
-                _vprint(f"[get]        ... (+{len(missing) - 12} more)")
-    # The release component also needs its release-level tarball dirs (plots).
-    if "__release__" in present:
-        for d in release_tar_dirs:
-            p = dest / d
-            if not (p.is_dir() and any(p.iterdir())):
-                _vprint(f"[get]   ✗ __release__: tarball dir {d}/ missing/empty → will re-download")
-                present.discard("__release__")
+    stem_full = name[: -len(".tar.zst")]
+    if trace_tag is None:
+        return stem_full
+    stem = stem_full[len(trace_tag) + 2 :]  # strip "<tag>--"
+    family = _NESTED_FAMILY.get(stem)
+    if family is None:
+        for pfx, fam in _NESTED_PREFIX:
+            if stem.startswith(pfx):
+                family = fam
                 break
-    return present
+    return f"{trace_tag}/{family}/{stem}" if family else f"{trace_tag}/{stem}"
 
 
-def _verify_sha256sums(root: Path, sums_path: Path | None = None, *, label: str = "") -> int:
+def _owned_paths(manifest: dict, scope_tags: set[str] | None = None) -> tuple[set[str], set[str]]:
+    """``(flat/extracted dest-relpaths, release-level-tarball stems)`` a v3
+    manifest owns, optionally restricted to `scope_tags`.
+
+    Used for cross-release orphan cleanup: a path a PRIOR release owned but the
+    new one does not is safe to delete. Files unknown to both manifests (user
+    data, unregistered tarball contents) are in neither set, so never deleted.
+    `scope_tags` (None = all) confines per-trace paths to the tags the user
+    actually requested, so a selective download never deletes an unrelated trace
+    the user fetched earlier. Release-level paths/stems are always included.
+    """
+
+    def keep(tag: str | None) -> bool:
+        return tag is None or scope_tags is None or tag in scope_tags
+
+    files: set[str] = {_MANIFEST_NAME, _SHA256SUMS_NAME}
+    stems: set[str] = set()
+    for a in manifest.get("assets", []):
+        name, tag = a["name"], a.get("trace_tag")
+        if name.endswith(".tar.zst"):
+            if tag is None:
+                stems.add(name[: -len(".tar.zst")])
+            # per-trace tarball contents are .safetensors -> covered via extracted_files
+        elif keep(tag):
+            files.add(_flat_asset_relpath(name, tag))
+    for e in manifest.get("extracted_files", []):
+        path = e.get("path")
+        if path and keep(e.get("trace_tag") or path.split("/", 1)[0]):
+            files.add(path)
+    return files, stems
+
+
+def _plan_fetch(
+    dest: Path,
+    manifest: dict,
+    wanted_tags: set[str] | None,
+    *,
+    refetch_release_tarballs: bool = False,
+) -> tuple[list[str], set[str]] | None:
+    """Decide the minimal asset set to download (v3 only).
+
+    Returns ``(patterns, verified)`` where ``patterns`` are EXACT asset names to
+    fetch and ``verified`` are dest-relpaths confirmed byte-correct against the
+    manifest this pass (so the post-extract verify can skip re-hashing them).
+    Returns ``None`` for non-v3 manifests (caller fetches everything — graceful
+    degradation per the get.py distribution contract).
+
+    Scope: release-level assets (``trace_tag`` None) always; per-trace assets
+    only for tags in ``wanted_tags`` (None = all). A FLAT asset is satisfied iff
+    its dest file hashes to the manifest sha. A per-trace TARBALL is satisfied
+    iff every extracted_files entry it produces is present + hash-correct; a
+    tarball with NO extracted_files evidence (unattributed) can't be confirmed,
+    so it is always fetched. When a tag's attributed tarballs don't cleanly
+    partition its extracted files (convention drift), the attributed set falls
+    back to one all-or-nothing group. Release-level tarballs (contents not in the
+    registry) use an existence check, except on a cross-release reconcile
+    (`refetch_release_tarballs`) where their bytes can't be confirmed and they
+    are re-fetched.
+    """
+    if manifest.get("format_version") != 3:
+        return None
+
+    extracted = {
+        e["path"]: e["sha256"] for e in manifest.get("extracted_files", []) if e.get("path")
+    }
+    assets = manifest.get("assets", [])
+
+    def in_scope(tag: str | None) -> bool:
+        return tag is None or wanted_tags is None or tag in wanted_tags
+
+    # Flat .safetensors also appear in extracted_files (writer priority (a)) —
+    # exclude them from tarball attribution so a present flat file isn't counted
+    # toward a tarball's completeness.
+    flat_extracted = {
+        _flat_asset_relpath(a["name"], a["trace_tag"])
+        for a in assets
+        if a.get("trace_tag") and a["name"].endswith(".safetensors")
+    }
+
+    patterns: list[str] = []
+    verified: set[str] = set()
+
+    def group_ok(paths: set[str]) -> bool:
+        """All paths present in dest AND hash-match? Records matches in `verified`
+        only on full success (a partial group is re-fetched whole)."""
+        matched: list[str] = []
+        for p in sorted(paths):
+            fp = dest / p
+            if fp.is_file() and _sha256_file(fp) == extracted.get(p):
+                matched.append(p)
+            else:
+                return False
+        verified.update(matched)
+        return True
+
+    # --- Flat assets: per-asset decision (the main per-file reuse win) ---
+    for a in assets:
+        name, tag = a["name"], a.get("trace_tag")
+        if not in_scope(tag) or name.endswith(".tar.zst"):
+            continue
+        rel = _flat_asset_relpath(name, tag)
+        fp = dest / rel
+        if fp.is_file() and _sha256_file(fp) == a["sha256"]:
+            verified.add(rel)
+        else:
+            patterns.append(name)
+
+    # --- Release-level tarballs: existence-only, unless a cross-release reconcile
+    #     (their contents aren't in the registry, so changed bytes under the same
+    #     stem can't be detected — re-fetch to be safe). ---
+    for a in assets:
+        name, tag = a["name"], a.get("trace_tag")
+        if tag is not None or not name.endswith(".tar.zst"):
+            continue
+        d = dest / name[: -len(".tar.zst")]
+        if refetch_release_tarballs or not (d.is_dir() and any(d.iterdir())):
+            patterns.append(name)
+
+    # --- Per-trace tarballs: per-(stream, layer) when attribution is clean ---
+    tarball_tags = sorted(
+        {
+            a["trace_tag"]
+            for a in assets
+            if a.get("trace_tag") and a["name"].endswith(".tar.zst") and in_scope(a["trace_tag"])
+        }
+    )
+    for tag in tarball_tags:
+        tballs = [
+            a["name"]
+            for a in assets
+            if a.get("trace_tag") == tag and a["name"].endswith(".tar.zst")
+        ]
+        attributed = {
+            n: {
+                p
+                for p in extracted
+                if p == _tarball_extract_prefix(n, tag)
+                or p.startswith(_tarball_extract_prefix(n, tag) + "/")
+            }
+            for n in tballs
+        }
+        # A tarball with no extracted_files evidence can't be confirmed present →
+        # always fetch it. Decide the rest from the attributed tarballs only.
+        patterns.extend(n for n in tballs if not attributed[n])
+        attr = [n for n in tballs if attributed[n]]
+        union: set[str] = set().union(*(attributed[n] for n in attr)) if attr else set()
+        tag_tarball_files = {p for p in extracted if p.split("/", 1)[0] == tag} - flat_extracted
+        if union == tag_tarball_files:
+            for n in attr:  # clean partition -> per-tarball
+                if not group_ok(attributed[n]):
+                    patterns.append(n)
+        elif not group_ok(tag_tarball_files):  # drift -> all-or-nothing per tag
+            patterns.extend(attr)
+
+    return list(dict.fromkeys(patterns)), verified
+
+
+def _read_prior_manifest(dest: Path) -> dict | None:
+    """Parse the release currently in `dest` (if any), for cross-release cleanup.
+
+    Returns None only when there is no readable manifest object. A present file
+    that isn't a JSON object (corrupt scalar/array, truncated) yields None too,
+    so the caller's present-but-unreadable refuse-to-mix guard fires instead of a
+    later AttributeError on `.get(...)`.
+    """
+    p = dest / _MANIFEST_NAME
+    if not p.is_file():
+        return None
+    try:
+        parsed = json.loads(p.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write `data` to `path` atomically (temp file in the same dir + os.replace),
+    so a crash mid-write never leaves a half-written index that a later run would
+    mistake for a corrupt prior bundle."""
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+
+
+def _orphan_cleanup(dest: Path, prior: dict, new: dict, scope_tags: set[str] | None = None) -> None:
+    """Delete files/dirs the PRIOR release owned that the new one doesn't, then
+    prune the dirs THIS cleanup emptied.
+
+    Only paths the prior manifest explicitly owned (within `scope_tags`) are
+    removed, so user files, unregistered content, and out-of-scope traces the
+    user fetched earlier are never touched. Symlinks are skipped and every target
+    is confirmed inside `dest`, and a problematic entry can't abort the run.
+    """
+    prior_files, prior_stems = _owned_paths(prior, scope_tags)
+    new_files, new_stems = _owned_paths(new, scope_tags)
+    dest_resolved = dest.resolve()
+    removed = 0
+    touched: set[Path] = set()
+
+    def _within(p: Path) -> bool:
+        try:
+            p.resolve().relative_to(dest_resolved)
+            return True
+        except (ValueError, OSError):
+            return False
+
+    for rel in sorted(prior_files - new_files):
+        fp = dest / rel
+        if fp.is_file() and not fp.is_symlink() and _within(fp):
+            try:
+                fp.unlink()
+            except OSError:
+                continue
+            removed += 1
+            touched.add(fp.parent)
+            _vprint(f"[get]   - removed stale {rel}")
+    for stem in sorted(prior_stems - new_stems):
+        d = dest / stem
+        if d.is_dir() and not d.is_symlink() and _within(d):
+            try:
+                shutil.rmtree(d)
+            except OSError:
+                continue
+            removed += 1
+            touched.add(d.parent)
+            _vprint(f"[get]   - removed stale dir {stem}/")
+    # Prune ONLY the dirs this cleanup emptied (each touched parent + its
+    # ancestors up to, but not including, dest) — never blanket-walk the tree, so
+    # the user's own empty dirs are left alone.
+    for start in sorted(touched, key=lambda p: len(p.parts), reverse=True):
+        d = start
+        while d != dest and d.is_relative_to(dest):
+            try:
+                if any(d.iterdir()):
+                    break
+                d.rmdir()
+            except OSError:
+                break
+            d = d.parent
+    if removed:
+        print(f"[get] reconciled prior release: removed {removed} stale file(s)/dir(s)")
+
+
+def _verify_sha256sums(
+    root: Path,
+    sums_path: Path | None = None,
+    *,
+    label: str = "",
+    skip: set[str] | None = None,
+    scope_tags: set[str] | None = None,
+    known_tags: set[str] | None = None,
+) -> int:
     """Verify files under `root` against their SHA256SUMS lines.
 
     Lines whose file is absent under `root` are skipped (the
@@ -399,30 +628,41 @@ def _verify_sha256sums(root: Path, sums_path: Path | None = None, *, label: str 
         (`<tag>/ffn_context/...`, `<tag>/kv_cache_layer_*.safetensors`, …)
         resolve; the tarball-namespace lines are gone → skipped.
 
+    `skip` names (dest-relative paths) already hash-verified during fetch
+    planning are not re-hashed — each file is hashed at most once per run. When
+    `scope_tags` is set (a selective download), per-trace lines whose head
+    segment is a `known_tags` trace NOT in `scope_tags` are skipped — so a
+    selective download doesn't fail on an out-of-scope trace the user fetched
+    from a different release (mirrors validate.py's --downloaded-traces scoping).
     `sums_path` defaults to `root/SHA256SUMS`. Returns the number of files
     actually verified (non-skipped). Raises on any content mismatch.
     """
-    import hashlib
-
-    sums_file = sums_path if sums_path is not None else (root / "SHA256SUMS")
+    sums_file = sums_path if sums_path is not None else (root / _SHA256SUMS_NAME)
     if not sums_file.is_file():
         print("[get] WARN: SHA256SUMS not present — skipping verify")
         return 0
+    skip = skip or set()
+    known_tags = known_tags or set()
     failed = []
     checked = 0
+    reused = 0
     for line in sums_file.read_text().splitlines():
         line = line.strip()
         if not line:
             continue
         sha, name = line.split(maxsplit=1)
+        name = name.lstrip("*")  # BSD-style checksum marker parity with validate.py
+        if name in skip:
+            reused += 1
+            continue
+        if scope_tags is not None:
+            head = name.split("/", 1)[0]
+            if head in known_tags and head not in scope_tags:
+                continue  # out-of-scope per-trace line (selective download)
         target = root / name
         if not target.is_file():
             continue  # absent in this context (selective download / namespace) — ok
-        h = hashlib.sha256()
-        with open(target, "rb") as f:
-            for chunk in iter(lambda: f.read(1 << 20), b""):
-                h.update(chunk)
-        actual = h.hexdigest()
+        actual = _sha256_file(target)
         if actual != sha:
             failed.append(name)
             _vprint(f"[get]   ✗ {name}  (expected {sha[:12]}, got {actual[:12]})")
@@ -437,7 +677,8 @@ def _verify_sha256sums(root: Path, sums_path: Path | None = None, *, label: str 
             f"dir) and re-run get.py to re-download."
         )
     tag = f" ({label})" if label else ""
-    print(f"[get] SHA256SUMS verified{tag}: {checked} file(s)")
+    extra = f", {reused} reused from prior run" if reused else ""
+    print(f"[get] SHA256SUMS verified{tag}: {checked} file(s){extra}")
     return checked
 
 
@@ -450,95 +691,124 @@ def download_bundle(tag: str, trace_tags: list[str] | None, dest: Path) -> None:
     if staging.exists():
         shutil.rmtree(staging)
 
-    # Fetch the two tiny metadata files first (manifest.json + SHA256SUMS).
-    # They let us (a) enumerate release-level assets and (b) detect which
-    # components are ALREADY in dest so we can skip re-downloading them. We do
-    # NOT rely on `gh release download --skip-existing` (absent on older gh):
-    # we detect present components ourselves and fetch only the missing ones
-    # into a FRESH staging dir, so gh never meets a pre-existing file.
-    manifest, sums_text = _fetch_release_metadata(tag, dest)
+    # Fetch the two tiny index files first (manifest.json + SHA256SUMS), as exact
+    # bytes. They carry every asset + its sha, so we hash whatever is ALREADY in
+    # dest against them and fetch ONLY the assets whose bytes aren't present. We
+    # do NOT rely on `gh release download --skip-existing` (absent on older gh):
+    # we fetch the missing assets into a FRESH staging dir, so gh never meets a
+    # pre-existing file.
+    manifest, manifest_bytes, sums_bytes = _fetch_release_metadata(tag, dest)
 
-    # Refuse to mix releases: if dest already holds a DIFFERENT release, the
-    # extract/move below would only overwrite same-named paths and silently
-    # leave the other release's files behind. Make the user start from clean.
-    dm = dest / "manifest.json"
-    if dm.is_file():
-        try:
-            prior_commit = json.loads(dm.read_text()).get("release_commit")
-        except (json.JSONDecodeError, OSError):
-            prior_commit = None
-        new_commit = manifest.get("release_commit")
-        if prior_commit and new_commit and prior_commit != new_commit:
+    # Capture the release CURRENTLY in dest (if any) BEFORE we overwrite its
+    # index, so we can reconcile across releases below.
+    prior_manifest = _read_prior_manifest(dest)
+    fmt = manifest.get("format_version")
+    prior_fmt = prior_manifest.get("format_version") if prior_manifest else None
+    prior_commit = prior_manifest.get("release_commit") if prior_manifest else None
+    new_commit = manifest.get("release_commit")
+
+    # A present-but-unparseable index means a corrupt/partial prior bundle: we
+    # can't enumerate what it owns to reconcile it, so refuse to mix rather than
+    # extract on top (the index is written atomically below, so this never fires
+    # on our own interrupted write). Empty dirs (no index) fall through.
+    if prior_manifest is None and (dest / _MANIFEST_NAME).is_file():
+        raise SystemExit(
+            f"{dest} holds an unreadable {_MANIFEST_NAME} (corrupt or partial prior "
+            f"download). Delete the directory (or use a fresh one) and re-run."
+        )
+
+    # Cross-release policy (decided up front, before any download):
+    #   - both v3: per-asset content-hash reuse + orphan cleanup is safe, so
+    #     reuse byte-identical files from the prior release and reconcile after.
+    #   - any pre-v3 bundle involved: no per-file registry to enumerate the prior
+    #     release's extracted files, so refuse to mix (original guard) rather than
+    #     risk leaving its stale files behind.
+    cross_release = (
+        prior_manifest is not None
+        and fmt == 3
+        and prior_fmt == 3
+        and bool(prior_commit)
+        and bool(new_commit)
+        and prior_commit != new_commit
+    )
+    do_orphan_cleanup = False
+    if prior_manifest is not None and prior_commit and new_commit and prior_commit != new_commit:
+        if fmt == 3 and prior_fmt == 3:
+            do_orphan_cleanup = True
+        else:
             raise SystemExit(
-                f"{dest} already holds a different release of {tag} "
-                f"(commit {prior_commit[:12]}; you requested {new_commit[:12]}). "
-                f"Delete the directory (or use a fresh one) and re-run — get.py "
-                f"won't mix two releases in one dir."
+                f"{dest} already holds a different release (commit {prior_commit[:12]}; "
+                f"you requested {new_commit[:12]}) that can't be safely reconciled "
+                f"(pre-v3 bundle, no per-file registry). Delete the directory (or use "
+                f"a fresh one) and re-run."
             )
+    elif fmt == 3 and prior_fmt == 3:
+        # Same release re-run: orphan cleanup is a no-op but harmless, and prunes
+        # leftovers from an interrupted prior run of this same release.
+        do_orphan_cleanup = prior_manifest is not None
 
-    all_trace_tags = [t["tag"] for t in manifest.get("traces", []) if "tag" in t]
-    known_components = set(_expected_files_by_component(manifest)[0])
-    wanted = {"__release__"} | set(all_trace_tags if trace_tags is None else trace_tags)
-    # v3 only: drop any wanted component the manifest ships nothing for. A
-    # degenerate empty trace tag would otherwise yield an unsatisfiable
-    # "<tag>--*" pattern that makes gh exit nonzero and abort the whole bundle.
-    if known_components:
-        wanted &= known_components | {"__release__"}
-    present = _components_present(dest, manifest, sums_text)
-    to_fetch = sorted(wanted - present)
-    reused = sorted(wanted & present)
+    # Persist the authoritative index now (exact released bytes, atomically), so
+    # dest always holds manifest.json + SHA256SUMS even when every other asset is
+    # skipped, and the pre/post-extract verify can read dest/SHA256SUMS. Done
+    # AFTER capturing prior_manifest above.
+    _atomic_write_bytes(dest / _MANIFEST_NAME, manifest_bytes)
+    _atomic_write_bytes(dest / _SHA256SUMS_NAME, sums_bytes)
 
-    if not to_fetch:
+    known_tags = {t["tag"] for t in manifest.get("traces", []) if "tag" in t}
+    wanted_tags = None if trace_tags is None else (set(trace_tags) & known_tags)
+
+    # On a cross-release reconcile, release-level tarball bytes can't be confirmed
+    # from the per-file registry, so force a re-fetch (a same-stem dir may hold the
+    # prior release's contents).
+    plan = _plan_fetch(dest, manifest, wanted_tags, refetch_release_tarballs=cross_release)
+    if plan is None:
+        # Pre-v3 fallback (no extracted_files registry): no per-asset reuse —
+        # fetch every in-scope asset. Exact release-level names + per-tag globs.
+        patterns = [
+            _MANIFEST_NAME,
+            _SHA256SUMS_NAME,
+            "REPORT.md",
+            "debug_trace_io.py",
+            "validate.py",
+        ]
+        patterns += [a["name"] for a in manifest.get("assets", []) if a.get("trace_tag") is None]
+        patterns += [f"{t}--*" for t in sorted(known_tags if wanted_tags is None else wanted_tags)]
+        patterns = list(dict.fromkeys(patterns))
+        verified: set[str] = set()
+    else:
+        patterns, verified = plan
+
+    if not patterns:
         print(
-            f"[get] release already present in {dest} — skipping download "
-            f"({len(wanted)} component(s) verified against manifest)"
+            f"[get] release already present in {dest} — nothing to download "
+            f"({len(verified)} file(s) verified against the manifest)"
         )
     else:
-        if reused:
+        if verified:
             print(
-                f"[get] reusing {len(reused)} already-present component(s); "
-                f"fetching {len(to_fetch)}: {', '.join(to_fetch)}"
+                f"[get] reusing {len(verified)} already-present file(s); "
+                f"fetching {len(patterns)} asset(s)"
             )
-        # --pattern list for ONLY the components we still need. A trace tag's
-        # assets all begin "<tag>--"; release-level assets have no trace_tag.
-        patterns: list[str] = []
-        if "__release__" in to_fetch:
-            release_level = [
-                a["name"] for a in manifest.get("assets", []) if a.get("trace_tag") is None
-            ]
-            patterns += [
-                "manifest.json",
-                "SHA256SUMS",
-                "REPORT.md",
-                "debug_trace_io.py",
-                "validate.py",
-                *release_level,
-            ]
-        patterns += [f"{c}--*" for c in to_fetch if c != "__release__"]
-        patterns = list(dict.fromkeys(patterns))
-
+        else:
+            print(f"[get] fetching {len(patterns)} asset(s)")
         # Contract: confine ALL activity to dest — stage inside it, never /tmp.
         # Fresh staging => gh never sees a pre-existing file (no --skip-existing).
         staging.mkdir(parents=True)
         print(f"[get] staging: {staging}")
-        print(f"[get] gh release download {tag} (patterns: {patterns}) ...")
+        _vprint(f"[get] gh release download {tag} (patterns: {patterns}) ...")
         gh_release_download(tag, staging, patterns=patterns)
 
-        # Pre-extract: verify the downloaded tarballs/flat files against
-        # SHA256SUMS. Use the freshly-staged copy if we fetched the release
-        # component, else the already-present dest copy (partial tag fetch).
-        sums_for_verify = staging / "SHA256SUMS"
-        if not sums_for_verify.is_file():
-            sums_for_verify = dest / "SHA256SUMS"
-        _verify_sha256sums(staging, sums_path=sums_for_verify, label="pre-extract assets")
+        # Pre-extract: verify the freshly-downloaded assets against the
+        # asset-namespace lines of SHA256SUMS (the authoritative dest copy).
+        _verify_sha256sums(staging, sums_path=dest / _SHA256SUMS_NAME, label="pre-extract assets")
 
         use_native = _have_tar_zstd()
         print(f"[get] extracting tarballs (tar --zstd: {use_native}) ...")
         for tarball in sorted(staging.glob("*.tar.zst")):
             if "--" in tarball.name:
                 # Per-trace tarball -> dest/<tag>/... . A partial extract leaves
-                # missing extracted_files rows, so the tag is detected incomplete
-                # next run and re-fetched; direct extraction is safe.
+                # missing extracted_files rows, so the tarball is detected
+                # incomplete next run and re-fetched; direct extraction is safe.
                 _extract_tarball(tarball, dest, use_native_zstd=use_native)
             else:
                 # Release-level tarball (e.g. diversity_plots): its files aren't
@@ -557,32 +827,42 @@ def download_bundle(tag: str, trace_tags: list[str] | None, dest: Path) -> None:
 
         print("[get] placing flat per-trace + release-level files ...")
         for src in sorted(staging.iterdir()):
-            if not src.is_file():
+            if not src.is_file() or src.name.endswith(".tar.zst"):
                 continue
-            name = src.name
-            if name.endswith(".tar.zst"):
-                continue
-            if "--" in name:
-                trace_tag, flat = name.split("--", 1)
+            if "--" in src.name:
+                trace_tag, flat = src.name.split("--", 1)
                 target = dest / trace_tag / flat
             else:
-                target = dest / name
+                target = dest / src.name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(src), str(target))
 
         # Staging fully consumed (tarballs extracted, flat files moved). Remove
-        # it so the post-extract verify + validate.py see a clean dest.
+        # it so the orphan cleanup + verify + validate.py see a clean dest.
         shutil.rmtree(staging, ignore_errors=True)
 
+    # Cross-release reconcile (v3↔v3 only): remove files the PRIOR release owned
+    # but this one doesn't, so dest holds exactly one release with no stale
+    # leftovers. Scoped to wanted_tags so a selective download never deletes an
+    # out-of-scope trace the user fetched earlier. Replaces the old refuse-to-mix
+    # guard for the v3 path.
+    if do_orphan_cleanup:
+        _orphan_cleanup(dest, prior_manifest, manifest, scope_tags=wanted_tags)
+
     # Post-extract: verify the extracted .safetensors against the
-    # extracted-namespace lines in SHA256SUMS (manifest v3 extracted_files).
-    # SHA256SUMS was moved into dest by the flat-file loop above. This
-    # realizes the per-extracted-file integrity guarantee in the default
-    # consumer flow (not just a manual `sha256sum -c`). On a v2 bundle
-    # (no extracted-namespace lines) this verifies 0 extra files — harmless.
-    sums_in_dest = dest / "SHA256SUMS"
-    if sums_in_dest.is_file():
-        _verify_sha256sums(dest, sums_in_dest, label="post-extract .safetensors")
+    # extracted-namespace lines in SHA256SUMS (manifest v3 extracted_files),
+    # skipping any file already hash-confirmed during fetch planning so each file
+    # is hashed at most once. Scoped to wanted_tags so a selective download
+    # doesn't fail on an out-of-scope trace the user holds from another release.
+    # On a v2 bundle (no extracted-namespace lines) this verifies 0 extra files.
+    _verify_sha256sums(
+        dest,
+        dest / _SHA256SUMS_NAME,
+        label="post-extract .safetensors",
+        skip=verified,
+        scope_tags=wanted_tags,
+        known_tags=known_tags,
+    )
 
     # Full validate.py (NOT --quick): the reader-contract gates (8-14) open
     # each downloaded trace with the bundle's shipped debug_trace_io
