@@ -43,6 +43,14 @@ from pathlib import Path
 
 _RELEASE_REPO = "tenstorrent/bit_sculpt"
 
+# Set from --verbose in main(); gates the extra per-file/per-component logging.
+_VERBOSE = False
+
+
+def _vprint(msg: str) -> None:
+    if _VERBOSE:
+        print(msg)
+
 
 # ---------- TTY / TUI primitives ----------
 
@@ -320,27 +328,46 @@ def _components_present(dest: Path, manifest: dict, sums_text: str) -> set[str]:
     """
     expected, release_tar_dirs = _expected_files_by_component(manifest)
     if not expected:
+        _vprint("[get] manifest has no extracted_files registry (pre-v3) — "
+                "can't confirm existing files; will download everything")
         return set()  # not v3 / no registry — can't confirm anything
     dm = dest / "manifest.json"
     ds = dest / "SHA256SUMS"
     if not dm.is_file() or not ds.is_file():
+        _vprint(f"[get] no prior manifest.json/SHA256SUMS in {dest} — fresh download")
         return set()
     try:
         if json.loads(dm.read_text()).get("release_commit") != manifest.get("release_commit"):
+            _vprint("[get] dest manifest.json is for a different release_commit — "
+                    "nothing reused")
             return set()  # different release cached in dest
         if ds.read_text() != sums_text:
+            _vprint("[get] dest SHA256SUMS differs from this release — nothing reused")
             return set()  # integrity manifest changed
     except (json.JSONDecodeError, OSError):
         return set()
+    _vprint(f"[get] scanning {dest} for existing components ...")
     present: set[str] = set()
     for comp, files in expected.items():
-        if all((dest / p).is_file() for p in files):
+        missing = sorted(p for p in files if not (dest / p).is_file())
+        if not missing:
             present.add(comp)
+            _vprint(f"[get]   ✓ {comp}: all {len(files)} file(s) present "
+                    f"(will be checksum-validated)")
+        else:
+            _vprint(f"[get]   ✗ {comp}: {len(files) - len(missing)}/{len(files)} "
+                    f"present, {len(missing)} missing → will download:")
+            for p in missing[:12]:
+                _vprint(f"[get]        - {p}")
+            if len(missing) > 12:
+                _vprint(f"[get]        ... (+{len(missing) - 12} more)")
     # The release component also needs its release-level tarball dirs (plots).
     if "__release__" in present:
         for d in release_tar_dirs:
             p = dest / d
             if not (p.is_dir() and any(p.iterdir())):
+                _vprint(f"[get]   ✗ __release__: tarball dir {d}/ missing/empty "
+                        f"→ will re-download")
                 present.discard("__release__")
                 break
     return present
@@ -381,10 +408,13 @@ def _verify_sha256sums(root: Path, sums_path: Path | None = None, *, label: str 
         with open(target, "rb") as f:
             for chunk in iter(lambda: f.read(1 << 20), b""):
                 h.update(chunk)
-        if h.hexdigest() != sha:
+        actual = h.hexdigest()
+        if actual != sha:
             failed.append(name)
+            _vprint(f"[get]   ✗ {name}  (expected {sha[:12]}, got {actual[:12]})")
         else:
             checked += 1
+            _vprint(f"[get]   ✓ {name}  ({sha[:12]})")
     if failed:
         raise RuntimeError(
             f"sha256 mismatch on {len(failed)} file(s): "
@@ -674,7 +704,16 @@ def main() -> int:
         nargs="?",
         help="destination dir. Omit for interactive trace picker + dest prompt.",
     )
+    p.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Verbose: log per-component completeness (which files are found "
+        "and will be checksum-validated vs. which are missing and will be "
+        "downloaded) and each file as its SHA256 is verified.",
+    )
     args = p.parse_args()
+
+    global _VERBOSE
+    _VERBOSE = args.verbose
 
     if args.tag is None:
         return cmd_interactive()
