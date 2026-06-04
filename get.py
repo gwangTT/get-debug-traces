@@ -54,12 +54,13 @@ def _vprint(msg: str) -> None:
 
 # ---------- TTY / TUI primitives ----------
 
+
 def _ensure_tty() -> None:
     """Re-attach stdin to /dev/tty for `curl | python3 -` invocations."""
     if sys.stdin.isatty():
         return
     if os.path.exists("/dev/tty"):
-        sys.stdin = open("/dev/tty", "r")
+        sys.stdin = open("/dev/tty")
         return
     print(
         "No terminal available; pass <tag> <dest> for non-interactive use.",
@@ -97,9 +98,7 @@ def pick_many(prompt: str, options: list[tuple[str, str]]) -> list[int]:
             if desc:
                 line += f"   {desc}"
             print(line)
-        raw = input(
-            "Toggle/action (number, 'a'=all, 'n'=none, Enter=confirm): "
-        ).strip().lower()
+        raw = input("Toggle/action (number, 'a'=all, 'n'=none, Enter=confirm): ").strip().lower()
         if raw == "":
             chosen = [i for i, on in enumerate(selected) if on]
             if not chosen:
@@ -127,6 +126,7 @@ def prompt_dest(default: str) -> str:
 
 # ---------- gh CLI wrappers ----------
 
+
 def _check_gh() -> None:
     """Fail fast if `gh` isn't installed or isn't authed for the repo."""
     if shutil.which("gh") is None:
@@ -135,18 +135,12 @@ def _check_gh() -> None:
             "and run `gh auth login` (this script needs read access to "
             f"{_RELEASE_REPO})."
         )
-    r = subprocess.run(
-        ["gh", "auth", "status"], capture_output=True, text=True
-    )
+    r = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
     if r.returncode != 0:
         raise SystemExit(
-            "gh CLI is installed but not authenticated. "
-            "Run `gh auth login` and retry."
+            "gh CLI is installed but not authenticated. Run `gh auth login` and retry."
         )
-    r = subprocess.run(
-        ["gh", "api", f"repos/{_RELEASE_REPO}"],
-        capture_output=True, text=True
-    )
+    r = subprocess.run(["gh", "api", f"repos/{_RELEASE_REPO}"], capture_output=True, text=True)
     if r.returncode != 0:
         raise SystemExit(
             f"gh CLI can't reach {_RELEASE_REPO}. Check your auth scopes "
@@ -157,12 +151,19 @@ def _check_gh() -> None:
 def gh_release_list() -> list[dict]:
     r = subprocess.run(
         [
-            "gh", "release", "list",
-            "--repo", _RELEASE_REPO,
-            "--limit", "100",
-            "--json", "tagName,name,publishedAt,isDraft,isPrerelease",
+            "gh",
+            "release",
+            "list",
+            "--repo",
+            _RELEASE_REPO,
+            "--limit",
+            "100",
+            "--json",
+            "tagName,name,publishedAt,isDraft,isPrerelease",
         ],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     )
     items = json.loads(r.stdout)
     return [x for x in items if not x.get("isDraft")]
@@ -171,18 +172,23 @@ def gh_release_list() -> list[dict]:
 def gh_release_view(tag: str) -> dict:
     r = subprocess.run(
         [
-            "gh", "release", "view", tag,
-            "--repo", _RELEASE_REPO,
-            "--json", "tagName,name,publishedAt,assets,body",
+            "gh",
+            "release",
+            "view",
+            tag,
+            "--repo",
+            _RELEASE_REPO,
+            "--json",
+            "tagName,name,publishedAt,assets,body",
         ],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     )
     return json.loads(r.stdout)
 
 
-def gh_release_download(
-    tag: str, dest: Path, patterns: list[str] | None = None
-) -> None:
+def gh_release_download(tag: str, dest: Path, patterns: list[str] | None = None) -> None:
     """Fetch release assets via gh (auth + retries handled by gh).
 
     `--skip-existing` is deliberately NOT used: it was added in a recent gh
@@ -191,9 +197,14 @@ def gh_release_download(
     an existing file (the condition --skip-existing / --clobber would guard).
     """
     cmd = [
-        "gh", "release", "download", tag,
-        "--repo", _RELEASE_REPO,
-        "--dir", str(dest),
+        "gh",
+        "release",
+        "download",
+        tag,
+        "--repo",
+        _RELEASE_REPO,
+        "--dir",
+        str(dest),
     ]
     if patterns:
         for p in patterns:
@@ -235,6 +246,7 @@ def fetch_manifest(tag: str, dest: Path) -> dict:
 
 # ---------- Download + extract ----------
 
+
 def _python_has_torch() -> bool:
     """Whether the interpreter that runs validate.py can import torch.
 
@@ -245,6 +257,7 @@ def _python_has_torch() -> bool:
     """
     try:
         import importlib.util
+
         return importlib.util.find_spec("torch") is not None
     except Exception:
         return False
@@ -252,9 +265,7 @@ def _python_has_torch() -> bool:
 
 def _have_tar_zstd() -> bool:
     try:
-        r = subprocess.run(
-            ["tar", "--help"], capture_output=True, text=True, timeout=10
-        )
+        r = subprocess.run(["tar", "--help"], capture_output=True, text=True, timeout=10)
         return "--zstd" in (r.stdout + r.stderr)
     except Exception:
         return False
@@ -267,12 +278,11 @@ def _extract_tarball(tarball: Path, dest: Path, use_native_zstd: bool) -> None:
             check=True,
         )
         return
-    with subprocess.Popen(
-        ["zstd", "-dc", str(tarball)], stdout=subprocess.PIPE
-    ) as zproc:
+    with subprocess.Popen(["zstd", "-dc", str(tarball)], stdout=subprocess.PIPE) as zproc:
         subprocess.run(
             ["tar", "-xf", "-", "-C", str(dest)],
-            stdin=zproc.stdout, check=True,
+            stdin=zproc.stdout,
+            check=True,
         )
         zproc.stdout.close()  # type: ignore[union-attr]
         if zproc.wait() != 0:
@@ -328,8 +338,10 @@ def _components_present(dest: Path, manifest: dict, sums_text: str) -> set[str]:
     """
     expected, release_tar_dirs = _expected_files_by_component(manifest)
     if not expected:
-        _vprint("[get] manifest has no extracted_files registry (pre-v3) — "
-                "can't confirm existing files; will download everything")
+        _vprint(
+            "[get] manifest has no extracted_files registry (pre-v3) — "
+            "can't confirm existing files; will download everything"
+        )
         return set()  # not v3 / no registry — can't confirm anything
     dm = dest / "manifest.json"
     ds = dest / "SHA256SUMS"
@@ -338,8 +350,7 @@ def _components_present(dest: Path, manifest: dict, sums_text: str) -> set[str]:
         return set()
     try:
         if json.loads(dm.read_text()).get("release_commit") != manifest.get("release_commit"):
-            _vprint("[get] dest manifest.json is for a different release_commit — "
-                    "nothing reused")
+            _vprint("[get] dest manifest.json is for a different release_commit — nothing reused")
             return set()  # different release cached in dest
         if ds.read_text() != sums_text:
             _vprint("[get] dest SHA256SUMS differs from this release — nothing reused")
@@ -352,11 +363,14 @@ def _components_present(dest: Path, manifest: dict, sums_text: str) -> set[str]:
         missing = sorted(p for p in files if not (dest / p).is_file())
         if not missing:
             present.add(comp)
-            _vprint(f"[get]   ✓ {comp}: all {len(files)} file(s) present "
-                    f"(will be checksum-validated)")
+            _vprint(
+                f"[get]   ✓ {comp}: all {len(files)} file(s) present (will be checksum-validated)"
+            )
         else:
-            _vprint(f"[get]   ✗ {comp}: {len(files) - len(missing)}/{len(files)} "
-                    f"present, {len(missing)} missing → will download:")
+            _vprint(
+                f"[get]   ✗ {comp}: {len(files) - len(missing)}/{len(files)} "
+                f"present, {len(missing)} missing → will download:"
+            )
             for p in missing[:12]:
                 _vprint(f"[get]        - {p}")
             if len(missing) > 12:
@@ -366,8 +380,7 @@ def _components_present(dest: Path, manifest: dict, sums_text: str) -> set[str]:
         for d in release_tar_dirs:
             p = dest / d
             if not (p.is_dir() and any(p.iterdir())):
-                _vprint(f"[get]   ✗ __release__: tarball dir {d}/ missing/empty "
-                        f"→ will re-download")
+                _vprint(f"[get]   ✗ __release__: tarball dir {d}/ missing/empty → will re-download")
                 present.discard("__release__")
                 break
     return present
@@ -390,6 +403,7 @@ def _verify_sha256sums(root: Path, sums_path: Path | None = None, *, label: str 
     actually verified (non-skipped). Raises on any content mismatch.
     """
     import hashlib
+
     sums_file = sums_path if sums_path is not None else (root / "SHA256SUMS")
     if not sums_file.is_file():
         print("[get] WARN: SHA256SUMS not present — skipping verify")
@@ -427,9 +441,7 @@ def _verify_sha256sums(root: Path, sums_path: Path | None = None, *, label: str 
     return checked
 
 
-def download_bundle(
-    tag: str, trace_tags: list[str] | None, dest: Path
-) -> None:
+def download_bundle(tag: str, trace_tags: list[str] | None, dest: Path) -> None:
     dest.mkdir(parents=True, exist_ok=True)
 
     # Never let a stale staging dir from an interrupted prior run survive into
@@ -477,20 +489,31 @@ def download_bundle(
     reused = sorted(wanted & present)
 
     if not to_fetch:
-        print(f"[get] release already present in {dest} — skipping download "
-              f"({len(wanted)} component(s) verified against manifest)")
+        print(
+            f"[get] release already present in {dest} — skipping download "
+            f"({len(wanted)} component(s) verified against manifest)"
+        )
     else:
         if reused:
-            print(f"[get] reusing {len(reused)} already-present component(s); "
-                  f"fetching {len(to_fetch)}: {', '.join(to_fetch)}")
+            print(
+                f"[get] reusing {len(reused)} already-present component(s); "
+                f"fetching {len(to_fetch)}: {', '.join(to_fetch)}"
+            )
         # --pattern list for ONLY the components we still need. A trace tag's
         # assets all begin "<tag>--"; release-level assets have no trace_tag.
         patterns: list[str] = []
         if "__release__" in to_fetch:
-            release_level = [a["name"] for a in manifest.get("assets", [])
-                             if a.get("trace_tag") is None]
-            patterns += ["manifest.json", "SHA256SUMS", "REPORT.md",
-                         "debug_trace_io.py", "validate.py", *release_level]
+            release_level = [
+                a["name"] for a in manifest.get("assets", []) if a.get("trace_tag") is None
+            ]
+            patterns += [
+                "manifest.json",
+                "SHA256SUMS",
+                "REPORT.md",
+                "debug_trace_io.py",
+                "validate.py",
+                *release_level,
+            ]
         patterns += [f"{c}--*" for c in to_fetch if c != "__release__"]
         patterns = list(dict.fromkeys(patterns))
 
@@ -599,6 +622,7 @@ def download_bundle(
 
 # ---------- Subcommands ----------
 
+
 def _release_summary(r: dict) -> str:
     date = (r.get("publishedAt") or "")[:10]
     name = r.get("name") or ""
@@ -658,9 +682,7 @@ def cmd_interactive() -> int:
     if not releases:
         print("(no releases available)")
         return 1
-    options: list[tuple[str, str]] = [
-        (r["tagName"], _release_summary(r)) for r in releases
-    ]
+    options: list[tuple[str, str]] = [(r["tagName"], _release_summary(r)) for r in releases]
     options.append(("Quit", ""))
     idx = pick_one("Pick a release tag:", options)
     if idx == len(options) - 1:
@@ -677,7 +699,7 @@ def cmd_with_tag(tag: str, dest: str | None) -> int:
         raise SystemExit(
             f"tag {tag!r} not found in {_RELEASE_REPO}. "
             f"Run `gh release list --repo {_RELEASE_REPO}` to see all tags."
-        )
+        ) from None
     if dest is None:
         _ensure_tty()
         return _interactive_trace_picker(tag)
@@ -686,6 +708,7 @@ def cmd_with_tag(tag: str, dest: str | None) -> int:
 
 
 # ---------- Entry ----------
+
 
 def main() -> int:
     p = argparse.ArgumentParser(
@@ -705,7 +728,9 @@ def main() -> int:
         help="destination dir. Omit for interactive trace picker + dest prompt.",
     )
     p.add_argument(
-        "-v", "--verbose", action="store_true",
+        "-v",
+        "--verbose",
+        action="store_true",
         help="Verbose: log per-component completeness (which files are found "
         "and will be checksum-validated vs. which are missing and will be "
         "downloaded) and each file as its SHA256 is verified.",
